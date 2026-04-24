@@ -1,15 +1,37 @@
+"""
+handler.py — LTX-2.3 (22B dev) RunPod Serverless worker.
+
+Uses the Lightricks LTX-2 'TI2VidTwoStagesPipeline' (two-stage text/image-to-video,
+stage 1 @ half-res with CFG, stage 2 @ 2x spatial upsample refined with the distilled
+LoRA) for production-quality output at the configured resolution.
+
+Model assets are expected on the RunPod network volume at the paths produced by
+download_models.py. If environment variables are set they override those defaults.
+"""
+import json
 import os
-import time
-import uuid
 import tempfile
+import time
+import traceback
+import uuid
+from pathlib import Path
+
 import boto3
 import requests
 import runpod
 
-LTX_CHECKPOINT = os.environ["LTX_CHECKPOINT"]
-DISTILLED_LORA = os.environ["DISTILLED_LORA"]
-SPATIAL_UPSCALER = os.environ["SPATIAL_UPSCALER"]
-GEMMA_ROOT = os.environ["GEMMA_ROOT"]
+# ---------------------------------------------------------------------------
+# Paths / environment
+# ---------------------------------------------------------------------------
+VOLUME = Path(os.environ.get("RUNPOD_VOLUME_PATH", "/runpod-volume"))
+LTX_DIR = VOLUME / "models" / "ltx-2.3"
+GEMMA_DIR = VOLUME / "models" / "gemma-qat-unquantized"
+
+LTX_CHECKPOINT = os.environ.get("LTX_CHECKPOINT") or str(LTX_DIR / "ltx-2.3-22b-dev.safetensors")
+DISTILLED_LORA = os.environ.get("DISTILLED_LORA") or str(LTX_DIR / "ltx-2.3-22b-distilled-lora-384-1.1.safetensors")
+SPATIAL_UPSCALER = os.environ.get("SPATIAL_UPSCALER") or str(LTX_DIR / "ltx-2.3-spatial-upscaler-x2-1.1.safetensors")
+GEMMA_ROOT = os.environ.get("GEMMA_ROOT") or str(GEMMA_DIR)
+
 R2_ENDPOINT = os.environ["R2_ENDPOINT_URL"]
 R2_ACCESS_KEY = os.environ["R2_ACCESS_KEY_ID"]
 R2_SECRET_KEY = os.environ["R2_SECRET_ACCESS_KEY"]
@@ -17,30 +39,105 @@ R2_BUCKET = os.environ["R2_BUCKET_NAME"]
 R2_PUBLIC_BASE = os.environ["R2_PUBLIC_URL"]
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 
+# ---------------------------------------------------------------------------
+# First-boot model download (idempotent)
+# ---------------------------------------------------------------------------
+def _ensure_models() -> None:
+    try:
+        import download_models  # local module next to handler.py
+        download_models.main()
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001
+        print(f"[worker] download_models failed: {e}", flush=True)
+        traceback.print_exc()
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Pipeline lifecycle (lazy singleton)
+# ---------------------------------------------------------------------------
 _pipeline = None
+_pipeline_ctx = None
+
+
+def _build_pipeline():
+    import torch
+    from ltx_core.loader import (
+        LTXV_LORA_COMFY_RENAMING_MAP,
+        LoraPathStrengthAndSDOps,
+    )
+    from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
+    from ltx_pipelines.utils.types import OffloadMode
+
+    print("[worker] Constructing TI2VidTwoStagesPipeline (LTX-2.3 22B dev)...", flush=True)
+
+    distilled_lora = [
+        LoraPathStrengthAndSDOps(
+            LTX_CHECKPOINT_LORA := DISTILLED_LORA,
+            1.0,
+            LTXV_LORA_COMFY_RENAMING_MAP,
+        ),
+    ]
+
+    pipeline = TI2VidTwoStagesPipeline(
+        checkpoint_path=LTX_CHECKPOINT,
+        distilled_lora=distilled_lora,
+        spatial_upsampler_path=SPATIAL_UPSCALER,
+        gemma_root=GEMMA_ROOT,
+        loras=[],
+        device=torch.device("cuda"),
+        quantization=None,
+        torch_compile=False,
+        # SUBMODELS offload lets us fit the 22B dev model + 12B text encoder on 94GB H100 NVL
+        # by moving submodels to CPU when not in use.
+        offload_mode=OffloadMode.SUBMODELS,
+    )
+    print("[worker] Pipeline ready.", flush=True)
+    return pipeline
 
 
 def get_pipeline():
     global _pipeline
     if _pipeline is not None:
         return _pipeline
-    print("[worker] Loading LTX-Video 2.3 pipeline...")
-    from ltx_video.pipelines.pipeline_ltx_video import LTXVideoPipeline
-    import torch
-    _pipeline = LTXVideoPipeline.from_pretrained(
-        ltx_checkpoint=LTX_CHECKPOINT,
-        distilled_lora_checkpoint=DISTILLED_LORA,
-        spatial_upscaler_checkpoint=SPATIAL_UPSCALER,
-        gemma_model_root=GEMMA_ROOT,
-        torch_dtype=torch.bfloat16,
-        device="cuda",
-    )
-    _pipeline.enable_model_cpu_offload()
-    print("[worker] Pipeline ready.")
+    _ensure_models()
+    _pipeline = _build_pipeline()
     return _pipeline
 
 
-def download_file(url, suffix):
+# ---------------------------------------------------------------------------
+# R2 upload helpers
+# ---------------------------------------------------------------------------
+def _s3_client():
+    return boto3.client(
+        "s3",
+        endpoint_url=R2_ENDPOINT,
+        aws_access_key_id=R2_ACCESS_KEY,
+        aws_secret_access_key=R2_SECRET_KEY,
+    )
+
+
+def upload_to_r2(local_path: str, key: str, content_type: str = "video/mp4") -> str:
+    _s3_client().upload_file(
+        local_path,
+        R2_BUCKET,
+        key,
+        ExtraArgs={"ContentType": content_type},
+    )
+    return f"{R2_PUBLIC_BASE.rstrip('/')}/{key}"
+
+
+def send_webhook(payload: dict) -> None:
+    if not WEBHOOK_URL:
+        return
+    try:
+        requests.post(WEBHOOK_URL, json=payload, timeout=10)
+    except Exception as e:  # noqa: BLE001
+        print(f"[worker] webhook send failed: {e}", flush=True)
+
+
+def download_file(url: str, suffix: str) -> str:
     r = requests.get(url, timeout=60)
     r.raise_for_status()
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
@@ -49,205 +146,158 @@ def download_file(url, suffix):
     return tmp.name
 
 
-def upload_to_r2(local_path, key):
-    s3 = boto3.client(
-        "s3",
-        endpoint_url=R2_ENDPOINT,
-        aws_access_key_id=R2_ACCESS_KEY,
-        aws_secret_access_key=R2_SECRET_KEY,
-    )
-    s3.upload_file(local_path, R2_BUCKET, key, ExtraArgs={"ContentType": "video/mp4"})
-    return f"{R2_PUBLIC_BASE.rstrip('/')}/{key}"
-
-
-def send_webhook(payload):
-    if not WEBHOOK_URL:
-        return
-    try:
-        requests.post(WEBHOOK_URL, json=payload, timeout=10)
-    except Exception as e:
-        print(f"[worker] Webhook error: {e}")
-
-
-def write_video(frames, fps, path):
-    import imageio
-    imageio.mimwrite(path, frames, fps=fps, quality=8)
-
-
-def run_text_to_video(pipe, inp, job_id):
+# ---------------------------------------------------------------------------
+# Generation
+# ---------------------------------------------------------------------------
+def _run_generation(pipeline, inp: dict, job_id: str) -> dict:
     import torch
-    seed = inp.get("seed", None)
-    generator = torch.Generator("cuda").manual_seed(seed) if seed is not None else None
-    result = pipe(
-        prompt=inp.get("prompt", ""),
-        negative_prompt=inp.get("negative_prompt", ""),
-        width=int(inp.get("width", 768)),
-        height=int(inp.get("height", 512)),
-        num_frames=int(inp.get("num_frames", 121)),
-        frame_rate=int(inp.get("fps", 24)),
-        guidance_scale=float(inp.get("guidance_scale", 3.5)),
-        num_inference_steps=int(inp.get("num_inference_steps", 40)),
-        generator=generator,
+    from ltx_core.components.guiders import MultiModalGuiderParams
+    from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
+    from ltx_pipelines.utils.constants import LTX_2_3_PARAMS
+    from ltx_pipelines.utils.media_io import encode_video
+
+    # ---- defaults sourced from LTX-2.3 reference params ----
+    params = LTX_2_3_PARAMS
+
+    prompt = inp.get("prompt", "")
+    if not prompt:
+        raise ValueError("Missing required input 'prompt'")
+    negative_prompt = inp.get(
+        "negative_prompt",
+        "worst quality, inconsistent motion, blurry, jittery, distorted",
     )
-    return result.frames[0], int(inp.get("fps", 24))
 
+    # Target output size — must be divisible by 32. Stage 1 runs at half these dims.
+    height = int(inp.get("height", 1024))
+    width = int(inp.get("width", 1536))
+    num_frames = int(inp.get("num_frames", params.num_frames))
+    frame_rate = float(inp.get("fps", params.frame_rate))
+    num_inference_steps = int(inp.get("num_inference_steps", params.num_inference_steps))
+    seed = int(inp.get("seed", params.seed))
 
-def run_image_to_video(pipe, inp, job_id):
-    import torch
-    from PIL import Image
-    seed = inp.get("seed", None)
-    generator = torch.Generator("cuda").manual_seed(seed) if seed is not None else None
-    w, h = int(inp.get("width", 768)), int(inp.get("height", 512))
-    img_path = download_file(inp["image_url"], ".jpg")
-    image = Image.open(img_path).convert("RGB").resize((w, h))
-    result = pipe(
-        prompt=inp.get("prompt", ""),
-        negative_prompt=inp.get("negative_prompt", ""),
-        image=image,
-        width=w,
-        height=h,
-        num_frames=int(inp.get("num_frames", 97)),
-        frame_rate=int(inp.get("fps", 24)),
-        guidance_scale=float(inp.get("guidance_scale", 3.5)),
-        num_inference_steps=int(inp.get("num_inference_steps", 40)),
-        generator=generator,
+    # Optional image conditioning (single image url)
+    images = None
+    temp_image_path = None
+    if inp.get("image_url"):
+        from PIL import Image
+
+        temp_image_path = download_file(inp["image_url"], ".png")
+        images = [Image.open(temp_image_path).convert("RGB")]
+
+    tiling_config = TilingConfig.default()
+    video_chunks_number = get_video_chunks_number(num_frames, tiling_config)
+
+    video_guider = MultiModalGuiderParams(
+        cfg_scale=float(inp.get("cfg_scale", params.video_guider_params.cfg_scale)),
+        stg_scale=float(inp.get("stg_scale", params.video_guider_params.stg_scale)),
+        rescale_scale=float(inp.get("rescale_scale", params.video_guider_params.rescale_scale)),
+        modality_scale=float(inp.get("a2v_scale", params.video_guider_params.modality_scale)),
+        skip_step=int(inp.get("skip_step", params.video_guider_params.skip_step)),
+        stg_blocks=list(inp.get("stg_blocks", params.video_guider_params.stg_blocks)),
     )
-    os.remove(img_path)
-    return result.frames[0], int(inp.get("fps", 24))
-
-
-def run_audio_to_video(pipe, inp, job_id):
-    import torch
-    import imageio
-    import subprocess
-    import json as _json
-    seed = inp.get("seed", None)
-    generator = torch.Generator("cuda").manual_seed(seed) if seed is not None else None
-    fps = int(inp.get("fps", 24))
-    audio_path = download_file(inp["audio_url"], ".mp3")
-    try:
-        probe = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", audio_path],
-            capture_output=True,
-            text=True,
-        )
-        duration = float(_json.loads(probe.stdout)["format"]["duration"])
-        num_frames = min(int(duration * fps), 257)
-    except Exception:
-        num_frames = int(inp.get("num_frames", 121))
-    result = pipe(
-        prompt=inp.get("prompt", ""),
-        negative_prompt=inp.get("negative_prompt", ""),
-        width=int(inp.get("width", 768)),
-        height=int(inp.get("height", 512)),
-        num_frames=num_frames,
-        frame_rate=fps,
-        guidance_scale=float(inp.get("guidance_scale", 3.5)),
-        num_inference_steps=int(inp.get("num_inference_steps", 40)),
-        generator=generator,
+    audio_guider = MultiModalGuiderParams(
+        cfg_scale=float(inp.get("audio_cfg_scale", params.audio_guider_params.cfg_scale)),
+        stg_scale=float(inp.get("audio_stg_scale", params.audio_guider_params.stg_scale)),
+        rescale_scale=float(inp.get("audio_rescale_scale", params.audio_guider_params.rescale_scale)),
+        modality_scale=float(inp.get("v2a_scale", params.audio_guider_params.modality_scale)),
+        skip_step=int(inp.get("audio_skip_step", params.audio_guider_params.skip_step)),
+        stg_blocks=list(inp.get("audio_stg_blocks", params.audio_guider_params.stg_blocks)),
     )
-    raw_path = f"/tmp/{job_id}_raw.mp4"
-    out_path = f"/tmp/{job_id}.mp4"
-    imageio.mimwrite(raw_path, result.frames[0], fps=fps, quality=8)
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", raw_path, "-i", audio_path, "-c:v", "copy", "-c:a", "aac", "-shortest", out_path],
-        check=True,
+
+    print(
+        f"[worker] Running pipeline: {width}x{height}, {num_frames}f @ {frame_rate}fps, "
+        f"steps={num_inference_steps}, seed={seed}",
+        flush=True,
     )
-    os.remove(raw_path)
-    os.remove(audio_path)
-    return out_path
-
-
-def run_extend(pipe, inp, job_id):
-    import torch
-    import imageio
-    from PIL import Image
-    seed = inp.get("seed", None)
-    generator = torch.Generator("cuda").manual_seed(seed) if seed is not None else None
-    w, h = int(inp.get("width", 768)), int(inp.get("height", 512))
-    vid_path = download_file(inp["video_url"], ".mp4")
-    reader = imageio.get_reader(vid_path)
-    existing = [f for f in reader]
-    reader.close()
-    os.remove(vid_path)
-    last_frame = Image.fromarray(existing[-1]).resize((w, h))
-    result = pipe(
-        prompt=inp.get("prompt", ""),
-        negative_prompt=inp.get("negative_prompt", ""),
-        image=last_frame,
-        width=w,
-        height=h,
-        num_frames=int(inp.get("num_frames", 97)),
-        frame_rate=int(inp.get("fps", 24)),
-        guidance_scale=float(inp.get("guidance_scale", 3.5)),
-        num_inference_steps=int(inp.get("num_inference_steps", 40)),
-        generator=generator,
-    )
-    return existing + list(result.frames[0]), int(inp.get("fps", 24))
-
-
-def run_retake(pipe, inp, job_id):
-    return run_text_to_video(pipe, inp, job_id)
-
-
-def handler(job):
-    job_id = job.get("id", str(uuid.uuid4()))
-    inp = job.get("input", {})
-    mode = inp.get("mode", "text_to_video")
-    user_id = inp.get("user_id", "unknown")
-    project_id = inp.get("project_id", "unknown")
-    print(f"[worker] job={job_id} mode={mode} user={user_id}")
     t0 = time.time()
+    video, audio = pipeline(
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        seed=seed,
+        height=height,
+        width=width,
+        num_frames=num_frames,
+        frame_rate=frame_rate,
+        num_inference_steps=num_inference_steps,
+        video_guider_params=video_guider,
+        audio_guider_params=audio_guider,
+        images=images,
+        tiling_config=tiling_config,
+        max_batch_size=1,
+    )
+    gen_time = time.time() - t0
+    print(f"[worker] Generation done in {gen_time:.1f}s", flush=True)
+
+    # ---- encode to MP4 ----
+    out_path = os.path.join(tempfile.gettempdir(), f"{job_id}.mp4")
+    encode_video(
+        video=video,
+        fps=int(round(frame_rate)),
+        audio=audio,
+        output_path=out_path,
+        video_chunks_number=video_chunks_number,
+    )
+
+    key = f"videos/{job_id}.mp4"
+    url = upload_to_r2(out_path, key, "video/mp4")
+
+    # ---- cleanup ----
     try:
-        pipe = get_pipeline()
-        if mode == "text_to_video":
-            frames, fps = run_text_to_video(pipe, inp, job_id)
-            out_path = f"/tmp/{job_id}.mp4"
-            write_video(frames, fps, out_path)
-        elif mode == "image_to_video":
-            frames, fps = run_image_to_video(pipe, inp, job_id)
-            out_path = f"/tmp/{job_id}.mp4"
-            write_video(frames, fps, out_path)
-        elif mode == "audio_to_video":
-            out_path = run_audio_to_video(pipe, inp, job_id)
-        elif mode == "extend":
-            frames, fps = run_extend(pipe, inp, job_id)
-            out_path = f"/tmp/{job_id}.mp4"
-            write_video(frames, fps, out_path)
-        elif mode == "retake":
-            frames, fps = run_retake(pipe, inp, job_id)
-            out_path = f"/tmp/{job_id}.mp4"
-            write_video(frames, fps, out_path)
-        else:
-            raise ValueError(f"Unknown mode: {mode}")
-        elapsed = round(time.time() - t0, 1)
-        key = f"videos/{user_id}/{project_id}/{job_id}.mp4"
-        url = upload_to_r2(out_path, key)
         os.remove(out_path)
-        payload = {
-            "job_id": job_id,
-            "status": "completed",
-            "mode": mode,
-            "video_url": url,
-            "duration_s": elapsed,
-            "user_id": user_id,
-            "project_id": project_id,
-        }
-        send_webhook(payload)
-        return payload
-    except Exception as exc:
-        import traceback
-        print(f"[worker] ERROR: {traceback.format_exc()}")
-        payload = {
+    except OSError:
+        pass
+    if temp_image_path:
+        try:
+            os.remove(temp_image_path)
+        except OSError:
+            pass
+    torch.cuda.empty_cache()
+
+    return {
+        "job_id": job_id,
+        "status": "success",
+        "video_url": url,
+        "generation_time_sec": round(gen_time, 2),
+        "width": width,
+        "height": height,
+        "num_frames": num_frames,
+        "fps": frame_rate,
+        "seed": seed,
+    }
+
+
+# ---------------------------------------------------------------------------
+# RunPod handler entrypoint
+# ---------------------------------------------------------------------------
+def handler(event):
+    job_id = (event or {}).get("id") or str(uuid.uuid4())
+    inp = (event or {}).get("input") or {}
+    mode = inp.get("mode", "text_to_video")
+    print(f"[worker] job={job_id} mode={mode}", flush=True)
+
+    try:
+        pipeline = get_pipeline()
+        if mode in ("text_to_video", "image_to_video", "ti2v"):
+            result = _run_generation(pipeline, inp, job_id)
+        else:
+            raise ValueError(
+                f"Unsupported mode '{mode}'. Supported: text_to_video, image_to_video.",
+            )
+        send_webhook(result)
+        return result
+    except Exception as e:  # noqa: BLE001
+        tb = traceback.format_exc()
+        print(f"[worker] ERROR: {tb}", flush=True)
+        err = {
             "job_id": job_id,
             "status": "failed",
             "mode": mode,
-            "error": str(exc),
-            "user_id": user_id,
-            "project_id": project_id,
+            "error": f"{type(e).__name__}: {e}",
+            "traceback": tb,
         }
-        send_webhook(payload)
-        return payload
+        send_webhook(err)
+        return err
 
 
-runpod.serverless.start({"handler": handler})
+if __name__ == "__main__":
+    runpod.serverless.start({"handler": handler})
