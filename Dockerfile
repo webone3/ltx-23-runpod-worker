@@ -22,9 +22,10 @@ RUN python -m pip install --upgrade pip setuptools wheel
 RUN pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
 
 # Base Python deps
+# Pin transformers to a version compatible with diffusers 0.30.3 (needs FLAX_WEIGHTS_NAME symbol)
 RUN pip install runpod==1.7.9 boto3 requests \
-    "huggingface_hub[hf_transfer]>=0.27.0" hf_transfer \
-    "transformers>=4.49.0" "accelerate>=1.4.0" \
+    "huggingface_hub[hf_transfer]>=0.24.0,<0.27.0" hf_transfer \
+    "transformers>=4.41.0,<4.46.0" "accelerate>=1.0.0,<1.4.0" \
     safetensors sentencepiece protobuf einops "imageio[ffmpeg]"
 
 # Pin diffusers 0.30.3 (pre flash_attn_3 auto-registration)
