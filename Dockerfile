@@ -1,40 +1,59 @@
-# LTX-Video 2.3 RunPod Serverless Worker
-# Use plain NVIDIA CUDA base so we control PyTorch version
-FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+# LTX-2.3 (22B dev) RunPod Serverless Worker — full two-stage pipeline
+# Uses CUDA 12.9 / PyTorch 2.7 / xformers per Lightricks/LTX-2 requirements (ltx-core ~torch 2.7, cu129 index).
+FROM nvidia/cuda:12.9.1-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV PIP_NO_CACHE_DIR=1
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV HF_HUB_ENABLE_HF_TRANSFER=1
 
-# System deps + Python 3.11
+# Stage 1: bootstrap essentials (curl + software-properties-common) so we can add deadsnakes PPA
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.11 python3.11-dev python3-pip python3.11-venv \
-    git ffmpeg ca-certificates build-essential \
+        curl ca-certificates gnupg software-properties-common \
+    && rm -rf /var/lib/apt/lists/*
+
+# Stage 2: Python 3.11 (via deadsnakes PPA) + system media/build deps used by ltx-pipelines
+# OpenImageIO provides 'openimageio' python bindings (dep of ltx-pipelines).
+# libav* are needed so PyAV builds/loads cleanly for MP4 encoding.
+RUN add-apt-repository ppa:deadsnakes/ppa -y \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3.11 python3.11-dev python3.11-venv python3.11-distutils \
+        git ffmpeg build-essential pkg-config \
+        libopenimageio-dev python3-openimageio \
+        libavformat-dev libavcodec-dev libavdevice-dev libavutil-dev \
+        libswscale-dev libswresample-dev libavfilter-dev \
+    && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11 \
     && ln -sf /usr/bin/python3.11 /usr/bin/python \
     && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Upgrade pip
+# Upgrade pip tooling
 RUN python -m pip install --upgrade pip setuptools wheel
 
-# PyTorch 2.5.1 with CUDA 12.4 (accepts string-form type annotations in torch.library)
-RUN pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
+# PyTorch 2.7.x with CUDA 12.9 (matches ltx-core requirements and xformers cu129 wheels)
+RUN pip install --index-url https://download.pytorch.org/whl/cu129 \
+        torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1
 
-# Base Python deps
-# Pin transformers to a version compatible with diffusers 0.30.3 (needs FLAX_WEIGHTS_NAME symbol)
-RUN pip install runpod==1.7.9 boto3 requests \
-    "huggingface_hub[hf_transfer]>=0.24.0,<0.27.0" hf_transfer \
-    "transformers>=4.41.0,<4.46.0" "accelerate>=1.0.0,<1.4.0" \
-    safetensors sentencepiece protobuf einops "imageio[ffmpeg]"
+# xformers for torch 2.7 / cu129 (attention optimizer for LTX-2.3 22B on H100 NVL)
+RUN pip install --index-url https://download.pytorch.org/whl/cu129 xformers
 
-# Pin diffusers 0.30.3 (pre flash_attn_3 auto-registration)
-RUN pip install "diffusers==0.30.3"
+# RunPod worker + R2 upload + media deps
+RUN pip install \
+        runpod==1.7.9 boto3 requests \
+        "huggingface_hub[hf_transfer]>=0.27.0" hf_transfer \
+        av tqdm pillow imageio imageio-ffmpeg
 
-# LTX-Video (without deps to avoid pulling bad torch)
-RUN pip install --no-deps git+https://github.com/Lightricks/LTX-Video.git
+# Install Lightricks LTX-2 monorepo packages (ltx-core + ltx-pipelines) from GitHub.
+RUN git clone --depth 1 https://github.com/Lightricks/LTX-2.git /opt/LTX-2 \
+    && pip install /opt/LTX-2/packages/ltx-core \
+    && pip install /opt/LTX-2/packages/ltx-pipelines
 
-# Belt and braces: make sure flash_attn is NOT present and cannot re-install
+# Build-time sanity check that the API we target actually imports
+RUN python -c "from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline; from ltx_core.components.guiders import MultiModalGuiderParams; from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number; from ltx_core.loader import LoraPathStrengthAndSDOps, LTXV_LORA_COMFY_RENAMING_MAP; from ltx_pipelines.utils.constants import LTX_2_3_PARAMS; from ltx_pipelines.utils.media_io import encode_video; print('[build-check] LTX-2 imports OK')"
+
+# Defensive: ensure flash_attn is NOT installed (we use xformers exclusively)
 RUN pip uninstall -y flash-attn flash_attn flash-attn-3 flash_attn_3 || true
 RUN pip list | grep -i flash || echo "OK: no flash_attn packages installed"
 
