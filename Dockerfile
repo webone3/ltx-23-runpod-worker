@@ -1,20 +1,41 @@
 # LTX-Video 2.3 RunPod Serverless Worker
-FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
+# Use plain NVIDIA CUDA base so we control PyTorch version
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Install base dependencies
-RUN pip install --no-cache-dir runpod==1.7.9 boto3 requests "huggingface_hub[hf_transfer]>=0.27.0" hf_transfer "transformers>=4.49.0" "accelerate>=1.4.0" safetensors sentencepiece protobuf einops "imageio[ffmpeg]"
+# System deps + Python 3.11
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 python3.11-dev python3-pip python3.11-venv \
+    git ffmpeg ca-certificates build-essential \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Pin diffusers to 0.30.3 - older version that doesn't try to register flash_attn_3
-RUN pip install --no-cache-dir "diffusers==0.30.3"
+# Upgrade pip
+RUN python -m pip install --upgrade pip setuptools wheel
 
-# Install LTX-Video without dependency overrides
-RUN pip install --no-cache-dir --no-deps git+https://github.com/Lightricks/LTX-Video.git
+# PyTorch 2.5.1 with CUDA 12.4 (accepts string-form type annotations in torch.library)
+RUN pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
 
-# Remove any flash_attn packages that may have been pulled in
-RUN pip uninstall -y flash-attn flash_attn flash-attn-3 flash_attn_3 2>/dev/null || true
+# Base Python deps
+RUN pip install runpod==1.7.9 boto3 requests \
+    "huggingface_hub[hf_transfer]>=0.27.0" hf_transfer \
+    "transformers>=4.49.0" "accelerate>=1.4.0" \
+    safetensors sentencepiece protobuf einops "imageio[ffmpeg]"
+
+# Pin diffusers 0.30.3 (pre flash_attn_3 auto-registration)
+RUN pip install "diffusers==0.30.3"
+
+# LTX-Video (without deps to avoid pulling bad torch)
+RUN pip install --no-deps git+https://github.com/Lightricks/LTX-Video.git
+
+# Belt and braces: make sure flash_attn is NOT present and cannot re-install
+RUN pip uninstall -y flash-attn flash_attn flash-attn-3 flash_attn_3 || true
+RUN pip list | grep -i flash || echo "OK: no flash_attn packages installed"
 
 WORKDIR /app
 COPY handler.py .
